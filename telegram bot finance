@@ -1,0 +1,464 @@
+import sqlite3
+from datetime import datetime
+import matplotlib.pyplot as plt
+from io import BytesIO
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackContext, MessageHandler, filters, ConversationHandler
+
+# Состояния для ConversationHandler
+ADD_EXPENSE, ADD_INCOME, SET_BUDGET = range(3)
+
+
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect("finance_bot.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            balance REAL DEFAULT 0,
+            budget REAL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            amount REAL,
+            reason TEXT,
+            date TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def get_db_connection():
+    return sqlite3.connect("finance_bot.db")
+
+
+def get_user_data(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT balance, budget FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+
+    if not result:
+        cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        balance, budget = 0, None
+    else:
+        balance, budget = result
+
+    conn.close()
+    return {"balance": balance, "budget": budget}
+
+
+def add_transaction(user_id, trans_type, amount, reason):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if trans_type == "Доход":
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+    else:
+        cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+
+    cursor.execute("""
+        INSERT INTO transactions (user_id, type, amount, reason)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, trans_type, amount, reason))
+
+    conn.commit()
+    conn.close()
+
+
+async def start(update: Update, context: CallbackContext):
+    user = update.message.from_user
+    get_user_data(user.id)
+
+    keyboard = [
+        [KeyboardButton("💸 Добавить расход"), KeyboardButton("💵 Добавить доход")],
+        [KeyboardButton("💰 Баланс"), KeyboardButton("📊 Установить бюджет")],
+        [KeyboardButton("📋 Все транзакции"), KeyboardButton("❌ Удалить последнюю")],
+        [KeyboardButton("🔄 Сбросить данные")]
+    ]
+
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    await update.message.reply_text(
+        "💰 <b>Финансовый помощник</b>\n\nВыберите действие:",
+        reply_markup=reply_markup,
+        parse_mode="HTML"
+    )
+
+
+async def handle_buttons(update: Update, context: CallbackContext):
+    text = update.message.text
+    user_id = update.message.from_user.id
+
+    if text == "💸 Добавить расход":
+        await update.message.reply_text(
+            "💸 Введите сумму и причину расхода:\n(Например: 500 Продукты)",
+            parse_mode="HTML"
+        )
+        return ADD_EXPENSE
+
+    elif text == "💵 Добавить доход":
+        await update.message.reply_text(
+            "💵 Введите сумму и причину дохода:\n(Например: 30000 Зарплата)",
+            parse_mode="HTML"
+        )
+        return ADD_INCOME
+
+    elif text == "💰 Баланс":
+        await show_balance(update, context)
+
+    elif text == "📊 Установить бюджет":
+        await update.message.reply_text(
+            "📊 Введите сумму вашего бюджета:",
+            parse_mode="HTML"
+        )
+        return SET_BUDGET
+
+    elif text == "📋 Все транзакции":
+        await show_all_transactions(update, context)
+
+    elif text == "❌ Удалить последнюю":
+        await delete_last_transaction(update, context)
+
+    elif text == "🔄 Сбросить данные":
+        await reset_data(update, context)
+
+    return ConversationHandler.END
+
+
+async def add_expense_handler(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    try:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError
+
+        amount = float(parts[0])
+        reason = parts[1]
+
+        if amount <= 0:
+            await update.message.reply_text("Сумма должна быть положительной!")
+            return ADD_EXPENSE
+
+        add_transaction(user_id, "Расход", amount, reason)
+
+        await update.message.reply_text(
+            f"💸 Расход добавлен:\nСумма: {amount} ₽\nПричина: {reason}",
+            parse_mode="HTML"
+        )
+
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            "❌ Неверный формат. Введите сумму и причину через пробел:\n500 Продукты",
+            parse_mode="HTML"
+        )
+        return ADD_EXPENSE
+
+    return ConversationHandler.END
+
+
+async def add_income_handler(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    try:
+        parts = update.message.text.split(maxsplit=1)
+        if len(parts) != 2:
+            raise ValueError
+
+        amount = float(parts[0])
+        reason = parts[1]
+
+        if amount <= 0:
+            await update.message.reply_text("Сумма должна быть положительной!")
+            return ADD_INCOME
+
+        add_transaction(user_id, "Доход", amount, reason)
+
+        await update.message.reply_text(
+            f"💵 Доход добавлен:\nСумма: {amount} ₽\nПричина: {reason}",
+            parse_mode="HTML"
+        )
+
+    except (ValueError, IndexError):
+        await update.message.reply_text(
+            "❌ Неверный формат. Введите сумму и причину через пробел:\n30000 Зарплата",
+            parse_mode="HTML"
+        )
+        return ADD_INCOME
+
+    return ConversationHandler.END
+
+
+async def set_budget_handler(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    try:
+        budget = float(update.message.text)
+
+        if budget <= 0:
+            await update.message.reply_text("Бюджет должен быть положительным!")
+            return SET_BUDGET
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET budget = ? WHERE user_id = ?", (budget, user_id))
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"📊 Бюджет установлен: {budget} ₽",
+            parse_mode="HTML"
+        )
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат. Введите число:",
+            parse_mode="HTML"
+        )
+        return SET_BUDGET
+
+    return ConversationHandler.END
+
+
+async def show_balance(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    user_data = get_user_data(user_id)
+
+    message = f"💰 Ваш баланс: {user_data['balance']} ₽"
+
+    if user_data['budget'] is not None:
+        remaining = user_data['budget'] + user_data['balance']
+        message += f"\n📊 Бюджет: {user_data['budget']} ₽"
+        message += f"\n📌 Осталось: {remaining} ₽"
+
+    await update.message.reply_text(message, parse_mode="HTML")
+
+
+async def generate_transactions_chart(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Получаем данные для графика
+    cursor.execute("""
+        SELECT type, amount, date 
+        FROM transactions 
+        WHERE user_id = ? 
+        ORDER BY date ASC
+    """, (user_id,))
+    transactions = cursor.fetchall()
+
+    cursor.execute("SELECT budget FROM users WHERE user_id = ?", (user_id,))
+    budget = cursor.fetchone()[0]
+    conn.close()
+
+    if not transactions:
+        return None
+
+    # Подготовка данных
+    dates = []
+    incomes = []
+    expenses = []
+    balance_history = []
+    current_balance = 0
+
+    for t_type, amount, date in transactions:
+        date_obj = datetime.strptime(date, "%Y-%m-%d %H:%M:%S")
+        dates.append(date_obj)
+
+        if t_type == "Доход":
+            incomes.append(amount)
+            expenses.append(0)
+            current_balance += amount
+        else:
+            expenses.append(amount)
+            incomes.append(0)
+            current_balance -= amount
+
+        balance_history.append(current_balance)
+
+    # Создаем график
+    plt.figure(figsize=(12, 8))
+
+    # График доходов и расходов
+    plt.subplot(2, 1, 1)
+    plt.bar(dates, incomes, color='green', alpha=0.6, label='Доходы')
+    plt.bar(dates, [-e for e in expenses], color='red', alpha=0.6, label='Расходы')
+    plt.title('Доходы и расходы')
+    plt.ylabel('Сумма (₽)')
+    plt.legend()
+    plt.grid(True)
+
+    # График баланса
+    plt.subplot(2, 1, 2)
+    plt.plot(dates, balance_history, marker='o', color='blue', label='Баланс')
+    if budget is not None:
+        plt.axhline(y=budget, color='orange', linestyle='--', label='Бюджет')
+    plt.title('История баланса')
+    plt.xlabel('Дата')
+    plt.ylabel('Сумма (₽)')
+    plt.legend()
+    plt.grid(True)
+
+    plt.tight_layout()
+
+    # Сохраняем график
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100)
+    buf.seek(0)
+    plt.close()
+
+    return buf
+
+
+async def show_all_transactions(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT type, amount, reason, strftime('%d.%m.%Y %H:%M:%S', date) as formatted_date 
+        FROM transactions 
+        WHERE user_id = ? 
+        ORDER BY date DESC
+    """, (user_id,))
+    transactions = cursor.fetchall()
+    conn.close()
+
+    if not transactions:
+        await update.message.reply_text("📭 У вас пока нет транзакций.")
+        return
+
+    # Разделяем транзакции
+    incomes = [t for t in transactions if t[0] == "Доход"]
+    expenses = [t for t in transactions if t[0] == "Расход"]
+
+    # Отправляем доходы
+    if incomes:
+        message = ["<b>💵 Все ваши доходы:</b>\n"]
+        for idx, (_, amount, reason, date) in enumerate(incomes, 1):
+            message.append(
+                f"{idx}. <b>{amount} ₽</b>\n"
+                f"   📝 <i>{reason}</i>\n"
+                f"   🕒 <code>{date}</code>\n"
+            )
+        for i in range(0, len(message), 5):
+            await update.message.reply_text("\n".join(message[i:i + 5]), parse_mode="HTML")
+    else:
+        await update.message.reply_text("📭 У вас пока нет доходов.")
+
+    # Отправляем расходы
+    if expenses:
+        message = ["<b>💸 Все ваши расходы:</b>\n"]
+        for idx, (_, amount, reason, date) in enumerate(expenses, 1):
+            message.append(
+                f"{idx}. <b>{amount} ₽</b>\n"
+                f"   📝 <i>{reason}</i>\n"
+                f"   🕒 <code>{date}</code>\n"
+            )
+        for i in range(0, len(message), 5):
+            await update.message.reply_text("\n".join(message[i:i + 5]), parse_mode="HTML")
+    else:
+        await update.message.reply_text("📭 У вас пока нет расходов.")
+
+    # Отправляем график
+    chart = await generate_transactions_chart(user_id)
+    if chart:
+        await update.message.reply_photo(
+            photo=chart,
+            caption="📊 График ваших транзакций и баланса",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text("Не удалось построить график транзакций.")
+
+
+async def delete_last_transaction(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, type, amount, reason, date 
+        FROM transactions 
+        WHERE user_id = ? 
+        ORDER BY date DESC, id DESC 
+        LIMIT 1
+    """, (user_id,))
+    transaction = cursor.fetchone()
+
+    if transaction:
+        trans_id, t_type, amount, reason, date = transaction
+        cursor.execute("DELETE FROM transactions WHERE id = ?", (trans_id,))
+
+        if t_type == "Доход":
+            cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+        else:
+            cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+
+        conn.commit()
+        await update.message.reply_text(
+            f"❌ Удалена транзакция:\n"
+            f"{t_type}: {amount} ₽\n"
+            f"Причина: {reason}\n"
+            f"Дата: {date}",
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text("❌ Нет транзакций для удаления.")
+
+    conn.close()
+
+
+async def reset_data(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM transactions WHERE user_id = ?", (user_id,))
+    cursor.execute("UPDATE users SET balance = 0, budget = NULL WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("🔄 Все данные сброшены. Баланс: 0 ₽")
+
+
+def main():
+    application = Application.builder().token("").build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons)],
+        states={
+            ADD_EXPENSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_expense_handler)],
+            ADD_INCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_income_handler)],
+            SET_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_budget_handler)],
+        },
+        fallbacks=[]
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
+
+    async def error_handler(update: Update, context: CallbackContext):
+        print(f"Ошибка: {context.error}")
+        if update.message:
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте еще раз.")
+
+    application.add_error_handler(error_handler)
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
